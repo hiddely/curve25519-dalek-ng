@@ -165,6 +165,8 @@ use zeroize::Zeroize;
 use backend;
 use constants;
 
+use rayon::prelude::*;
+
 /// An `UnpackedScalar` represents an element of the field GF(l), optimized for speed.
 ///
 /// This is a type alias for one of the scalar types in the `backend`
@@ -381,6 +383,7 @@ impl ConditionallySelectable for Scalar {
 use serde::{self, Serialize, Deserialize, Serializer, Deserializer};
 #[cfg(feature = "serde")]
 use serde::de::Visitor;
+use backend::serial::scalar_mul::variable_base::mul;
 
 #[cfg(feature = "serde")]
 impl Serialize for Scalar {
@@ -811,6 +814,88 @@ impl Scalar {
         ret
     }
 
+    /// Exponentiate
+    pub fn precompute_exponentiate(&self, exp: usize) -> Vec<Scalar> {
+        // Computes all the powers of value up to exp
+        // can we call this a multi-exponentiation?
+        let mut mul = self.unpack().to_montgomery();
+        let self_as_mont = self.unpack().to_montgomery();
+        let mut output: Vec<Scalar> = Vec::with_capacity(exp);
+        output.push(Scalar::one());
+        for _ in 0..exp-1 {
+            output.push(mul.from_montgomery().pack());
+            // mul = mul.montgomery_square();
+            mul = UnpackedScalar::montgomery_mul(&mul, &self_as_mont);
+        }
+        output
+    }
+
+    /// Exponentiate optimized
+    pub fn precompute_exponentiate_optimized(&self, exp: usize) -> Vec<Scalar> {
+        // Computes all the powers of value up to exp
+        // can we call this a multi-exponentiation?
+        let n_cores: usize = 16;
+        let chunk_size: usize = exp / n_cores;
+        assert_eq!(exp % n_cores, 0, "exp must be a multiple of n_cores");
+        let closest_power_of_2_exp = (32 - (exp as u32).leading_zeros() - 1) as usize;
+
+        let self_as_mont = self.unpack().to_montgomery();
+
+        let mut precomputed_squares: Vec<UnpackedScalar> = Vec::with_capacity(exp);
+        // precomputed_squares.push(Scalar::one().unpack().to_montgomery());
+        precomputed_squares.push(self_as_mont);
+        for i in 0..closest_power_of_2_exp {
+            precomputed_squares.push(precomputed_squares[i].montgomery_square());
+        }
+
+        (0..n_cores).into_par_iter().flat_map(|core_id| {
+            // Compute per chunk start index
+            let start_index = core_id * chunk_size;
+            let indices: Vec<usize> = (0..32).filter(|i| (start_index & (1 << i)) != 0).collect();
+            // println!("start_index: {:?} indices {:?}", start_index, indices);
+            // Add the indices together
+            let mut start_montgomery: UnpackedScalar = if start_index != 0 {
+                indices.into_iter()
+                    .map(|i| precomputed_squares[i]).reduce(|a, b| {
+                    // println!("a: {:?}, b: {:?}", a, b);
+                    UnpackedScalar::montgomery_mul(&a, &b)
+                }).unwrap()
+            } else {
+                Scalar::one().unpack().to_montgomery()
+            };
+            // println!("start_montgomery {:?}, chunk_size: {}", start_montgomery.from_montgomery().pack(), chunk_size);
+
+            let mut chunk_output: Vec<Scalar> = Vec::with_capacity(chunk_size);
+            chunk_output.push(start_montgomery.from_montgomery().pack());
+
+            // println!("start_montgomery {:?}, chunk_size: {}", start_montgomery.from_montgomery().pack(), chunk_size);
+
+            for _ in 1..chunk_size {
+                start_montgomery = UnpackedScalar::montgomery_mul(&start_montgomery, &self_as_mont);
+                chunk_output.push(start_montgomery.from_montgomery().pack());
+            }
+            return chunk_output
+        }).collect()
+    }
+
+    /// Exponentiate
+    pub fn exponentiate(&self, exp: usize) -> Scalar {
+        let lower_p2 = exp.next_power_of_two() >> 1;
+        let bits = lower_p2.leading_zeros() as i32;
+        let power_2 = 32 - bits;
+        let diff = (exp - lower_p2) as i32;
+        let mut mul = self.unpack().to_montgomery();
+        for _ in 0..power_2 {
+            mul = mul.montgomery_square();
+        }
+        let self_as_mont = self.unpack().to_montgomery();
+        for _ in 0..diff-1 {
+            // mul = mul.montgomery_square();
+            mul = UnpackedScalar::montgomery_mul(&mul, &self_as_mont);
+        }
+        mul.pack()
+    }
+
     /// Get the bits of the scalar.
     pub(crate) fn bits(&self) -> [i8; 256] {
         let mut bits = [0i8; 256];
@@ -1186,6 +1271,7 @@ impl UnpackedScalar {
 
 #[cfg(test)]
 mod test {
+    use std::time::SystemTime;
     use super::*;
     use constants;
 
@@ -1735,5 +1821,27 @@ mod test {
             test_pippenger_radix_iter(scalar, 7);
             test_pippenger_radix_iter(scalar, 8);
         }
+    }
+
+    #[test]
+    fn test_exponentiate() {
+        fn timeit<F: Fn() -> T, T>(f: F) -> T {
+            let start = SystemTime::now();
+            let result = f();
+            let end = SystemTime::now();
+            let duration = end.duration_since(start).unwrap();
+            println!("it took {} milliseconds", duration.as_millis());
+            result
+        }
+        let base = Scalar::from(2u64);
+        println!("base: {:?}", base);
+        println!("base: {:?}", base.unpack().pack());
+        println!("base: {:?}", base.unpack().to_montgomery().pack());
+        let exponent: usize = 2_usize.pow(19) as usize;
+        let result = timeit(|| base.precompute_exponentiate(exponent));
+        let result_optimized = timeit(|| base.precompute_exponentiate_optimized(exponent));
+        // println!("result: {:?}", result);
+        // println!("result_optimized: {:?}", result_optimized);
+        assert_eq!(result, result_optimized);
     }
 }
